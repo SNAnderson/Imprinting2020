@@ -1,0 +1,1237 @@
+---
+title: "Imprinting Github"
+output: html_notebook
+---
+
+```{r}
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+library(matrixStats)
+library(DESeq2)
+library(stringr)
+library(ggExtra)
+library(gridExtra)
+library(pheatmap)
+library(reshape2)
+library("ggalluvial")
+```
+
+```{r}
+give.n <- function(x){
+   return(c(y = mean(x), label = length(x)))
+}
+```
+
+SNP-ASE output
+See https://github.com/orionzhou/rnaseq/blob/master/output.md
+```{r}
+rds <- readRDS("ase_1Oct19.rds")
+ase.reads <- rds
+cpm <- readRDS("cpm.rds")
+lib.size.tab <- data.frame(cpm$tl)
+```
+
+```{r}
+ase.reads$ratio <- ase.reads$allele1/(ase.reads$allele1 + ase.reads$allele2)
+ase.reads$total.reads <- (ase.reads$allele1 + ase.reads$allele2)
+ase.reads$contrast <- substr(ase.reads$sid,0,2)
+ase.reads2 <- data.frame(ase.reads %>% 
+                           group_by(gid,contrast) %>% 
+                           dplyr::summarize(
+                             mean.ratio = mean(ratio),
+                             mean.count = mean(total.reads)))
+```
+
+Gene key
+B73 reference gene model cross-reference relative to v4
+Downloaded from MaizeGDB 2020/01/22, 11:32am
+Reformatted to remove header
+```{r}
+gene.key <- read.table("gene_model_xref_v4c.txt",sep="\t",header=T,stringsAsFactors = F)
+dup.gene <- subset(gene.key,duplicated(gene.key$v4_gene_model))
+gene.key <- subset(gene.key,!gene.key$v4_gene_model %in% dup.gene$v4_gene_model)
+gene.key.BW.syntelogs <- subset(gene.key,nchar(gene.key$W22.Zm00004b.1.) == 14)[,c(1:4,8,10,20,24)]
+gene.key.bp.syntelogs <- subset(gene.key,nchar(gene.key$PH207.Zm00008a.1.) == 14)[,c(1:4,8,10,20,24)]
+gene.key.BWP <- subset(gene.key,nchar(gene.key$W22.Zm00004b.1.) == 14 & nchar(gene.key$PH207.Zm00008a.1.) == 14)[,c(1:4,8,10,20,24)]
+```
+
+Read in RER table and calculate RPM
+```{r}
+imp.all <- read.table("combined_counts_all_concatinated_genomes_21Oct19.txt",header=T,stringsAsFactors = F) # update path 
+imp.all$ID <- str_replace_all(imp.all$ID,".v1.1","")
+imp.all.rpm <- imp.all
+for(i in 2:19){
+  imp.all.rpm[,i] <- imp.all[,i]/lib.size.tab[lib.size.tab$SampleID == colnames(imp.all[i]),"libSize"] * 1e6
+}
+
+imp.all2 <- subset(imp.all,!imp.all$ID %in% c("no_feature","ambiguous","too_low_aQual","not_aligned","alignment_not_unique")) # remove non-feature and ambiguous reads
+imp.all2$ID[grepl("gene",imp.all2$ID)] <- substr(imp.all2$ID[grepl("gene",imp.all2$ID)],6,19) # fix formatting
+```
+
+Summary stats about libraries
+```{r}
+imp.all.numerator <- subset(imp.all,!imp.all$ID %in% c("too_low_aQual","not_aligned","alignment_not_unique")) # remove non-feature and ambiguous reads
+imp.all.denominator <- subset(imp.all,!imp.all$ID %in% c("too_low_aQual","not_aligned")) # remove non-feature and ambiguous reads
+
+summary.stats.libraries <- data.frame(cbind(colSums(imp.all.denominator[,2:19]),(colSums(imp.all.numerator[,2:19])/colSums(imp.all.denominator[,2:19]))*100))
+names(summary.stats.libraries) <- c("Reads","Percent_Unique")
+mean(summary.stats.libraries$Percent_Unique)
+```
+
+
+```{r}
+imp.all.rpm2 <- subset(imp.all.rpm,!imp.all.rpm$ID %in% c("no_feature","ambiguous","too_low_aQual","not_aligned","alignment_not_unique")) # remove non-feature and ambiguous reads
+rownames(imp.all.rpm2) <- imp.all.rpm2$ID
+imp.all.rpm2$ID <- NULL
+rownames(imp.all.rpm2)[grepl("gene",rownames(imp.all.rpm2))] <- substr(rownames(imp.all.rpm2)[grepl("gene",rownames(imp.all.rpm2))],6,19) # fix formatting
+```
+
+
+```{r}
+imp.all.rpm2$BW.mean <- rowMeans(imp.all.rpm2[,1:3]) #ignore this (I hard coded column numbers later)
+imp.all.rpm2$WB.mean <- rowMeans(imp.all.rpm2[,4:6]) #ignore this (I hard coded column numbers later)
+imp.all.rpm2$B_ratio <- imp.all.rpm2$BW.mean/(imp.all.rpm2$BW.mean + imp.all.rpm2$WB.mean) #ignore this (I hard coded column numbers later)
+
+imp.all.rpm2$feature_type <- ifelse(nchar(rownames(imp.all.rpm2)) == 21, "TE","gene") # Label features as TEs or genes
+imp.all.rpm2$genome <- ifelse(grepl("Zm00001d",rownames(imp.all.rpm2)),"B73",ifelse(grepl("Zm00004b",rownames(imp.all.rpm2)),"W22","PH207")) # Label which genome the feature annotation is from
+table(imp.all.rpm2$genome)
+```
+
+For each pair of genotypes, make the same columns and then do the math for the maternal preference ratio
+```{r}
+imp.BvW.rpm <- imp.all.rpm2[,c(1:6,22:23)]
+imp.BvW.rpm$contrast <- "BW"
+imp.BvW.rpm$type <- ifelse(imp.BvW.rpm$genome == "B73","A","B")
+imp.BvW.rpm$feature <- rownames(imp.BvW.rpm)
+
+imp.BvP.rpm <- imp.all.rpm2[,c(7:12,22:23)]
+imp.BvP.rpm$contrast <- "BP"
+imp.BvP.rpm$type <- ifelse(imp.BvW.rpm$genome == "B73","A","B")
+imp.BvP.rpm$feature <- rownames(imp.BvP.rpm)
+
+imp.WvP.rpm <- imp.all.rpm2[,c(13:18,22:23)]
+imp.WvP.rpm$contrast <- "WP"
+imp.WvP.rpm$type <- ifelse(imp.BvW.rpm$genome == "W22","A","B")
+imp.WvP.rpm$feature <- rownames(imp.WvP.rpm)
+
+names(imp.BvW.rpm) <- names(imp.BvP.rpm) <- names(imp.WvP.rpm) <- c("AB1","AB2","AB3","BA1","BA2","BA3","feature_type","genome","contrast","type","feature")
+
+imp.recips.rpm <- data.frame(rbind(imp.BvW.rpm,imp.BvP.rpm,imp.WvP.rpm))
+
+imp.recips.rpm$A_mean <- rowMeans(imp.recips.rpm[,1:3])
+imp.recips.rpm$B_mean <- rowMeans(imp.recips.rpm[,4:6])
+imp.recips.rpm$maternal_preference <- ifelse(imp.recips.rpm$type == "A",imp.recips.rpm$A_mean/(imp.recips.rpm$A_mean + imp.recips.rpm$B_mean),imp.recips.rpm$B_mean/(imp.recips.rpm$A_mean + imp.recips.rpm$B_mean)) # maternal preferance calculation
+```
+
+Plot the maternal preferance distributipns for each contrast, genome, and feature type
+```{r}
+imp.recips.rpm.filter <- subset(imp.recips.rpm,imp.recips.rpm$A_mean >= 1 | imp.recips.rpm$B_mean >= 1)
+
+ggplot(imp.recips.rpm.filter,aes(x=genome,y=maternal_preference,fill=genome))+ geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + geom_violin() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + facet_wrap(feature_type~contrast,scales="free_x")  + stat_summary(fun.data = give.n, geom = "text") 
+```
+
+Look at per-element or gene expression across development
+```{r}
+dev.reads <- read.table("element_combined_counts_DevREDO_11Oct19.txt",header=T,stringsAsFactors = F,sep="\t")
+```
+
+```{r}
+rownames(dev.reads) <- dev.reads$element
+dev.reads$element <- NULL
+dev.reads2 <- dev.reads[,grep("te.g",colnames(dev.reads),invert = T)]
+names(dev.reads2) <- substr(names(dev.reads2),0,nchar(names(dev.reads2))-7)
+dev.reads3 <- dev.reads2[,grep("DS",colnames(dev.reads2))]
+
+  
+dev.rpm <- dev.reads3
+for(i in 1:ncol(dev.rpm)){
+  dev.rpm[,i] <- dev.reads3[,i]/sum(dev.reads3[,i]) * 1e6
+}
+```
+
+
+```{r}
+all.samples <- data.frame(names(dev.rpm))
+all.samples$colname <- paste(names(dev.rpm))
+all.samples <- separate(all.samples,names.dev.rpm.,c("tissue","details","experiment","genotype","rep"),sep="_")
+```
+
+Make filter for potential maternal contamination MEGs (TE plus gene)
+```{r}
+keep.columns <- c("endosperm_14dap_DS_B_1","endosperm_14dap_DS_B_2","endosperm_14dap_DS_B_3","seed_pericarp.18dap_DS_B_1","seed_pericarp.18dap_DS_B_2","seed_pericarp.18dap_DS_B_3")
+B73.endoperi.stepflug <- subset(dev.rpm, rowMaxs(as.matrix(dev.rpm[,keep.columns])) > 0)[,keep.columns]
+B73.endoperi.stepflug$mean.endo  <- rowMeans(B73.endoperi.stepflug[,1:3])
+B73.endoperi.stepflug$mean.peri <- rowMeans(B73.endoperi.stepflug[,4:6])
+peri.preferred <- subset(B73.endoperi.stepflug,B73.endoperi.stepflug$mean.peri > 2 * B73.endoperi.stepflug$mean.endo)
+nrow(peri.preferred)
+table(nchar(rownames(peri.preferred)))
+peri.preferred.W22 <- subset(gene.key,gene.key$v4_gene_model %in% rownames(peri.preferred))[,"W22.Zm00004b.1."]
+peri.preferred.PH207 <- subset(gene.key,gene.key$v4_gene_model %in% rownames(peri.preferred))[,"PH207.Zm00008a.1."]
+```
+
+Use DEseq to call significance over a log2FC cutoff of 1 (2-fold, which is the expected ratio)
+```{r}
+imp.all.de.bw <- imp.all2[,2:7]
+rownames(imp.all.de.bw) <- imp.all2$ID
+#imp.all.de.keep.bw <- subset(imp.all.de.bw,rowSums(imp.all.de.bw >0) >= 3) 
+imp.all.de.keep.bw <- subset(imp.all.de.bw,rowSums(imp.all.de.bw) >= 10) 
+#imp.all.de.keep.bw <- subset(imp.all.de.bw,rowMeans(imp.all.rpm2[,1:3]) >= 0.5 | rowMeans(imp.all.rpm2[,4:6]) >= 0.5) 
+
+sample.info.bw <- as.data.frame(cbind(paste(names(imp.all.de.keep.bw)),c("BW","BW","BW","WB","WB","WB")))
+rownames(sample.info.bw) <- sample.info.bw[,1]
+sample_list.bw <- sample.info.bw[,2]
+names(sample.info.bw) <- c("sample.info.bw","sample_list")
+
+dds.bw <- DESeqDataSetFromMatrix(countData = imp.all.de.keep.bw,colData = sample.info.bw, design = ~ sample_list)
+dds.bw <- DESeq(dds.bw)
+res.bw <- results(dds.bw, lfcThreshold=1, altHypothesis = "greaterAbs")
+drawLines <- function() abline(h=c(-1,1),col="dodgerblue",lwd=2)
+#par(mfrow=c(2,2),mar=c(2,2,1,1))
+ylim <- c(-2.5,2.5)
+plotMA(res.bw, ylim=ylim); drawLines()
+```
+
+Plot results with respect to RER
+```{r}
+out.bw <- data.frame(res.bw)
+plot.out.bw <- merge(imp.recips.rpm,out.bw,by.x="feature",by.y="row.names",all=F)
+plot.out.bw$sig <- ifelse(plot.out.bw$padj < 0.05, "TRUE", "FALSE")
+plot.out2.bw <- subset(plot.out.bw,!is.na(plot.out.bw$sig) & plot.out.bw$contrast %in% c("BW","WB"))
+plot.out2.bw$category <- ifelse(plot.out2.bw$padj < 0.05 & plot.out2.bw$log2FoldChange < -1 & (plot.out2.bw$maternal_preference > .9 | plot.out2.bw$maternal_preference < .1), "up",ifelse(plot.out2.bw$padj < 0.05 & plot.out2.bw$log2FoldChange > 1 & (plot.out2.bw$maternal_preference > .9 | plot.out2.bw$maternal_preference < .1),"down","notDE"))
+
+plot.out2.bw$imprint <- ifelse(plot.out2.bw$category =="up" & plot.out2.bw$genome == "B73","MEG",
+                               ifelse(plot.out2.bw$category =="down" & plot.out2.bw$genome == "B73","PEG",
+                                      ifelse(plot.out2.bw$category =="down" & plot.out2.bw$genome == "W22","MEG",
+                                             ifelse(plot.out2.bw$category =="up" & plot.out2.bw$genome == "W22","PEG","no.imprint"))))
+
+ggplot(plot.out2.bw,aes(x=imprint,y=maternal_preference,fill=imprint)) + geom_violin() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + facet_grid(genome~feature_type) + geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + stat_summary(fun.data = give.n, geom = "text") 
+
+plot.out2.bw$filter.imprint <- ifelse(plot.out2.bw$imprint == "MEG" & (plot.out2.bw$feature %in% rownames(peri.preferred) | plot.out2.bw$feature %in% peri.preferred.W22),"filtered.MEG",plot.out2.bw$imprint)
+```
+
+
+
+Repeat for BP
+```{r}
+imp.all.de.bp <- imp.all2[,8:13]
+rownames(imp.all.de.bp) <- imp.all2$ID
+#imp.all.de.keep.bp <- subset(imp.all.de.bp,rowSums(imp.all.de.bp >0) >= 3)
+imp.all.de.keep.bp <- subset(imp.all.de.bp,rowSums(imp.all.de.bp) >= 10)
+#imp.all.de.keep.bp <- subset(imp.all.de.bp,rowMeans(imp.all.rpm2[,7:9]) >= 0.5 | rowMeans(imp.all.rpm2[,10:12]) >= 0.5) 
+
+sample.info.bp <- as.data.frame(cbind(paste(names(imp.all.de.keep.bp)),c("BP","BP","BP","PB","PB","PB")))
+rownames(sample.info.bp) <- sample.info.bp[,1]
+sample_list.bp <- sample.info.bp[,2]
+names(sample.info.bp) <- c("sample.info.bp","sample_list")
+
+dds.bp <- DESeqDataSetFromMatrix(countData = imp.all.de.keep.bp,colData = sample.info.bp, design = ~ sample_list)
+dds.bp <- DESeq(dds.bp)
+res.bp <- results(dds.bp, lfcThreshold=1, altHypothesis = "greaterAbs")
+#par(mfrow=c(2,2),mar=c(2,2,1,1))
+ylim <- c(-2.5,2.5)
+plotMA(res.bp, ylim=ylim); drawLines()
+```
+
+Plot results with respect to RER
+```{r}
+out.bp <- data.frame(res.bp)
+plot.out.bp <- merge(imp.recips.rpm,out.bp,by.x="feature",by.y="row.names",all=F)
+plot.out.bp$sig <- ifelse(plot.out.bp$padj < 0.05, "TRUE", "FALSE")
+plot.out2.bp <- subset(plot.out.bp,!is.na(plot.out.bp$sig) & plot.out.bp$contrast %in% c("BP","PB"))
+
+plot.out2.bp$category <- ifelse(plot.out2.bp$padj < 0.05 & plot.out2.bp$log2FoldChange < -1 & (plot.out2.bp$maternal_preference > .9 | plot.out2.bp$maternal_preference < .1), "up",ifelse(plot.out2.bp$padj < 0.05 & plot.out2.bp$log2FoldChange > 1 & (plot.out2.bp$maternal_preference > .9 | plot.out2.bp$maternal_preference < .1),"down","notDE"))
+
+plot.out2.bp$imprint <- ifelse(plot.out2.bp$category =="up" & plot.out2.bp$genome == "B73","MEG",
+                               ifelse(plot.out2.bp$category =="down" & plot.out2.bp$genome == "B73","PEG",
+                                      ifelse(plot.out2.bp$category =="down" & plot.out2.bp$genome == "PH207","MEG",
+                                             ifelse(plot.out2.bp$category =="up" & plot.out2.bp$genome == "PH207","PEG","no.imprint"))))
+
+ggplot(plot.out2.bp,aes(x=imprint,y=maternal_preference,fill=imprint)) + geom_violin() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + facet_grid(genome~feature_type) + geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + stat_summary(fun.data = give.n, geom = "text") 
+
+plot.out2.bp$filter.imprint <- ifelse(plot.out2.bp$imprint == "MEG" & (plot.out2.bp$feature %in% rownames(peri.preferred) | plot.out2.bp$feature %in% peri.preferred.PH207),"filtered.MEG",plot.out2.bp$imprint)
+```
+
+Repeat for WP
+```{r}
+imp.all.de.wp <- imp.all2[,14:19]
+rownames(imp.all.de.wp) <- imp.all2$ID
+#imp.all.de.keep.wp <- subset(imp.all.de.wp,rowSums(imp.all.de.wp >0) >= 3)
+imp.all.de.keep.wp <- subset(imp.all.de.wp,rowSums(imp.all.de.wp) >= 10)
+#imp.all.de.keep.wp <- subset(imp.all.de.wp,rowMeans(imp.all.rpm2[,13:15]) >= 0.5 | rowMeans(imp.all.rpm2[,16:18]) >= 0.5) 
+
+sample.info.wp <- as.data.frame(cbind(paste(names(imp.all.de.keep.wp)),c("WP","WP","WP","PW","PW","PW")))
+rownames(sample.info.wp) <- sample.info.wp[,1]
+sample_list.wp <- sample.info.wp[,2]
+names(sample.info.wp) <- c("sample.info.wp","sample_list")
+
+dds.wp <- DESeqDataSetFromMatrix(countData = imp.all.de.keep.wp,colData = sample.info.wp, design = ~ sample_list)
+dds.wp <- DESeq(dds.wp)
+res.wp <- results(dds.wp, lfcThreshold=1, altHypothesis = "greaterAbs")
+drawLines <- function() abline(h=c(-1,1),col="dodgerblue",lwd=2)
+#par(mfrow=c(2,2),mar=c(2,2,1,1))
+ylim <- c(-2.5,2.5)
+plotMA(res.wp, ylim=ylim); drawLines()
+```
+
+Plot results with respect to the RER
+```{r}
+out.wp <- data.frame(res.wp)
+plot.out.wp <- merge(imp.recips.rpm,out.wp,by.x="feature",by.y="row.names",all=F)
+plot.out.wp$sig <- ifelse(plot.out.wp$padj < 0.05, "TRUE", "FALSE")
+plot.out2.wp <- subset(plot.out.wp,!is.na(plot.out.wp$sig) & plot.out.wp$contrast %in% c("WP","PW"))
+plot.out2.wp$category <- ifelse(plot.out2.wp$padj < 0.05 & plot.out2.wp$log2FoldChange < -1 & (plot.out2.wp$maternal_preference > .9 | plot.out2.wp$maternal_preference < .1), "up",ifelse(plot.out2.wp$padj < 0.05 & plot.out2.wp$log2FoldChange > 1 & (plot.out2.wp$maternal_preference > .9 | plot.out2.wp$maternal_preference < .1),"down","notDE"))
+
+plot.out2.wp$imprint <- ifelse(plot.out2.wp$category =="up" & plot.out2.wp$genome == "PH207","MEG",
+                               ifelse(plot.out2.wp$category =="down" & plot.out2.wp$genome == "PH207","PEG",
+                                      ifelse(plot.out2.wp$category =="down" & plot.out2.wp$genome == "W22","MEG",
+                                             ifelse(plot.out2.wp$category =="up" & plot.out2.wp$genome == "W22","PEG","no.imprint"))))
+
+
+ggplot(plot.out2.wp,aes(x=imprint,y=maternal_preference,fill=imprint)) + geom_violin() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + facet_grid(genome~feature_type) + geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + stat_summary(fun.data = give.n, geom = "text") 
+
+plot.out2.wp$filter.imprint <- ifelse(plot.out2.wp$imprint == "MEG" & (plot.out2.wp$feature %in% peri.preferred.W22 | plot.out2.wp$feature %in% peri.preferred.PH207),"filtered.MEG",plot.out2.wp$imprint)
+```
+
+Summarize imprinting calls
+```{r}
+summary.bw <- data.frame(plot.out2.bw %>% group_by(genome,feature_type,filter.imprint,contrast) %>% summarize(count = n()))
+summary.bp <- data.frame(plot.out2.bp %>% group_by(genome,feature_type,filter.imprint,contrast) %>% summarize(count = n()))
+summary.wp <- data.frame(plot.out2.wp %>% group_by(genome,feature_type,filter.imprint,contrast) %>% summarize(count = n()))
+
+summary.combined <- rbind(summary.bw,summary.bp,summary.wp)
+summary.combined
+
+summary.combined2 <- subset(summary.combined,summary.combined$filter.imprint %in% c("MEG","PEG"))
+summary.combined2[summary.combined2$filter.imprint == "PEG","count"] <- -summary.combined2[summary.combined2$filter.imprint == "PEG","count"]
+summary.combined2$label <- paste(summary.combined2$genome,summary.combined2$contrast,sep="_")
+
+ggplot() + geom_bar(aes(x=label,y=count,fill=filter.imprint),data=summary.combined2,stat="identity",position = "identity") + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) + facet_grid(.~feature_type,scales="free") + scale_fill_manual(values=c("magenta2","navy")) 
+```
+Average imprinted genes
+```{r}
+imp.genes <- subset(summary.combined2,summary.combined2$feature_type == "gene")
+imp.genes[imp.genes$filter.imprint == "PEG","count"] <- -imp.genes[imp.genes$filter.imprint == "PEG","count"]
+
+imp.genes2 <- imp.genes%>% group_by(label) %>% dplyr::summarise(total.imprint = sum(count))
+mean(imp.genes2$total.imprint)
+
+mean(subset(imp.genes,imp.genes$filter.imprint == "MEG")[,"count"])
+
+mean(subset(imp.genes,imp.genes$filter.imprint == "PEG")[,"count"])
+```
+
+```{r}
+mean(subset(summary.combined2,summary.combined2$feature_type == "TE" & summary.combined2$filter.imprint == "MEG")[,"count"])
+```
+
+
+
+
+Use to make venns - B73 vs W22
+```{r}
+compare.bw.syntelogs <- subset(plot.out2.bw,plot.out2.bw$feature_type == "gene")
+compare.bw.syntelogs$syntelog <- ifelse(compare.bw.syntelogs$feature %in% gene.key.BW.syntelogs$v4_gene_model | compare.bw.syntelogs$feature %in% gene.key.BW.syntelogs$W22.Zm00004b.1., "syntelog","non.syntelog")
+
+table(compare.bw.syntelogs[,c("genome","filter.imprint","syntelog")])
+
+compare.bw.syntelogs.b73 <- merge(subset(compare.bw.syntelogs,compare.bw.syntelogs$syntelog == "syntelog" & compare.bw.syntelogs$genome == "B73"),gene.key.BW.syntelogs,by.x="feature",by.y="v4_gene_model",all.x=T)
+compare.bw.syntelogs.w22 <- subset(compare.bw.syntelogs,compare.bw.syntelogs$syntelog == "syntelog" & compare.bw.syntelogs$genome == "W22")
+compare.bw.syntelogs.merge <- merge(compare.bw.syntelogs.b73,compare.bw.syntelogs.w22,by.x = "W22.Zm00004b.1.",by.y="feature",all=T)
+
+names(compare.bw.syntelogs.merge) <- gsub(".x",".B73",names(compare.bw.syntelogs.merge),fixed = T)
+names(compare.bw.syntelogs.merge) <- gsub(".y",".W22",names(compare.bw.syntelogs.merge),fixed = T)
+
+compare.bw.syntelogs.merge$imprint.B73[is.na(compare.bw.syntelogs.merge$imprint.B73)] <- "no.imprint"
+compare.bw.syntelogs.merge$imprint.W22[is.na(compare.bw.syntelogs.merge$imprint.W22)] <- "no.imprint"
+compare.bw.syntelogs.merge$filter.imprint.B73[is.na(compare.bw.syntelogs.merge$filter.imprint.B73)] <- "no.imprint"
+compare.bw.syntelogs.merge$filter.imprint.W22[is.na(compare.bw.syntelogs.merge$filter.imprint.W22)] <- "no.imprint"
+
+table(compare.bw.syntelogs.merge[,c("filter.imprint.B73","filter.imprint.W22")])
+```
+
+Use to make venns - B73 vs PH207
+```{r}
+compare.bp.syntelogs <- subset(plot.out2.bp,plot.out2.bp$feature_type == "gene")
+
+compare.bp.syntelogs$syntelog <- ifelse(compare.bp.syntelogs$feature %in% gene.key.bp.syntelogs$v4_gene_model | compare.bp.syntelogs$feature %in% gene.key.bp.syntelogs$PH207.Zm00008a.1., "syntelog","non.syntelog")
+
+table(compare.bp.syntelogs[,c("genome","filter.imprint","syntelog")])
+
+compare.bp.syntelogs.b73 <- merge(subset(compare.bp.syntelogs,compare.bp.syntelogs$syntelog == "syntelog" & compare.bp.syntelogs$genome == "B73"),gene.key.bp.syntelogs,by.x="feature",by.y="v4_gene_model",all.x=T)
+compare.bp.syntelogs.PH207 <- subset(compare.bp.syntelogs,compare.bp.syntelogs$syntelog == "syntelog" & compare.bp.syntelogs$genome == "PH207")
+compare.bp.syntelogs.merge <- merge(compare.bp.syntelogs.b73,compare.bp.syntelogs.PH207,by.x = "PH207.Zm00008a.1.",by.y="feature",all=T)
+
+names(compare.bp.syntelogs.merge) <- gsub(".x",".B73",names(compare.bp.syntelogs.merge),fixed = T)
+names(compare.bp.syntelogs.merge) <- gsub(".y",".PH207",names(compare.bp.syntelogs.merge),fixed = T)
+
+compare.bp.syntelogs.merge$imprint.B73[is.na(compare.bp.syntelogs.merge$imprint.B73)] <- "no.imprint"
+compare.bp.syntelogs.merge$imprint.PH207[is.na(compare.bp.syntelogs.merge$imprint.PH207)] <- "no.imprint"
+compare.bp.syntelogs.merge$filter.imprint.B73[is.na(compare.bp.syntelogs.merge$filter.imprint.B73)] <- "no.imprint"
+compare.bp.syntelogs.merge$filter.imprint.PH207[is.na(compare.bp.syntelogs.merge$filter.imprint.PH207)] <- "no.imprint"
+
+table(compare.bp.syntelogs.merge[,c("filter.imprint.B73","filter.imprint.PH207")])
+```
+
+matTE venns
+```{r}
+te.anno.compare <- read.table("non-redundant_TEs_by_annptation_4genomes_24Jan20.txt",header = T,stringsAsFactors = F)
+```
+B73 vs W22 TEs
+```{r}
+shared.BW <- subset(te.anno.compare, te.anno.compare$B73 == "present" & nchar(te.anno.compare$B73.annotation == 21) & te.anno.compare$W22 == "present" & nchar(te.anno.compare$W22.annotation == 21))
+
+compare.bw.TE <- subset(plot.out2.bw,plot.out2.bw$feature_type == "TE" & plot.out2.bw$filter.imprint == "MEG")
+compare.bw.TE$shared <- ifelse(compare.bw.TE$feature %in% shared.BW$B73.annotation | compare.bw.TE$feature %in% shared.BW$W22.annotation, "shared","variable")
+
+table(compare.bw.TE[,c("genome","filter.imprint","shared")])
+
+compare.bw.TE.b <- merge(subset(compare.bw.TE,compare.bw.TE$shared == "shared" & compare.bw.TE$genome == "B73"),shared.BW[,c("B73.annotation","W22.annotation")],by.x="feature",by.y="B73.annotation",all.x=T)
+compare.bw.TE.w <- subset(compare.bw.TE,compare.bw.TE$shared == "shared" & compare.bw.TE$genome == "W22")
+compare.bw.TE.merge <- merge(compare.bw.TE.b, compare.bw.TE.w, by.x="W22.annotation",by.y="feature",all=T)
+
+names(compare.bw.TE.merge) <- gsub(".x",".B73",names(compare.bw.TE.merge),fixed = T)
+names(compare.bw.TE.merge) <- gsub(".y",".W22",names(compare.bw.TE.merge),fixed = T)
+
+compare.bw.TE.merge$filter.imprint.B73[is.na(compare.bw.TE.merge$filter.imprint.B73)] <- "no.imprint"
+compare.bw.TE.merge$filter.imprint.W22[is.na(compare.bw.TE.merge$filter.imprint.W22)] <- "no.imprint"
+
+table(compare.bw.TE.merge[,c("filter.imprint.B73","filter.imprint.W22")])
+```
+
+
+B73 vs PH207 TEs
+```{r}
+shared.bp <- subset(te.anno.compare, te.anno.compare$B73 == "present" & nchar(te.anno.compare$B73.annotation) == 21 & te.anno.compare$PH207 == "present" & nchar(te.anno.compare$PH207.annotation) == 21)
+
+compare.bp.TE <- subset(plot.out2.bp,plot.out2.bp$feature_type == "TE" & plot.out2.bp$filter.imprint == "MEG")
+compare.bp.TE$shared <- ifelse(compare.bp.TE$feature %in% shared.bp$B73.annotation | compare.bp.TE$feature %in% shared.bp$P207.annotation, "shared","variable")
+
+table(compare.bp.TE[,c("genome","filter.imprint","shared")])
+
+compare.bp.TE.b <- merge(subset(compare.bp.TE,compare.bp.TE$shared == "shared" & compare.bp.TE$genome == "B73"),shared.bp[,c("B73.annotation","PH207.annotation")],by.x="feature",by.y="B73.annotation",all.x=T)
+compare.bp.TE.w <- subset(compare.bp.TE,compare.bp.TE$shared == "shared" & compare.bp.TE$genome == "PH207")
+compare.bp.TE.merge <- merge(compare.bp.TE.b, compare.bp.TE.w, by.x="PH207.annotation",by.y="feature",all=T)
+
+names(compare.bp.TE.merge) <- gsub(".x",".B73",names(compare.bp.TE.merge),fixed = T)
+names(compare.bp.TE.merge) <- gsub(".y",".PH207",names(compare.bp.TE.merge),fixed = T)
+
+compare.bp.TE.merge$filter.imprint.B73[is.na(compare.bp.TE.merge$filter.imprint.B73)] <- "no.imprint"
+compare.bp.TE.merge$filter.imprint.PH207[is.na(compare.bp.TE.merge$filter.imprint.PH207)] <- "no.imprint"
+
+table(compare.bp.TE.merge[,c("filter.imprint.B73","filter.imprint.PH207")])
+```
+
+How many MEGs called in only one direction were due to cutoffs and no data? Use B73 by W22 contrast for numbers
+```{r}
+B73.only.MEG.bw <- subset(compare.bw.syntelogs.merge,compare.bw.syntelogs.merge$filter.imprint.B73 == "MEG" & compare.bw.syntelogs.merge$filter.imprint.W22 == "no.imprint")
+B73.only.MEG.bw$category <- ifelse(is.na(B73.only.MEG.bw$maternal_preference.W22),"low.coverage",
+                                   ifelse(B73.only.MEG.bw$maternal_preference.W22 > 0.75,"RER>0.75","no.imprint"))
+B73.only.MEG.bw$group <- "B73.MEG.BW"
+
+W22.only.MEG.bw <- subset(compare.bw.syntelogs.merge,compare.bw.syntelogs.merge$filter.imprint.B73 == "no.imprint" & compare.bw.syntelogs.merge$filter.imprint.W22 == "MEG")
+W22.only.MEG.bw$category <- ifelse(is.na(W22.only.MEG.bw$maternal_preference.B73),"low.coverage",
+                                   ifelse(W22.only.MEG.bw$maternal_preference.B73 > 0.75,"RER>0.75","no.imprint"))
+W22.only.MEG.bw$group <- "W22.MEG.BW"
+
+B73.only.MEG.bp <- subset(compare.bp.syntelogs.merge,compare.bp.syntelogs.merge$filter.imprint.B73 == "MEG" & compare.bp.syntelogs.merge$filter.imprint.PH207 == "no.imprint")
+B73.only.MEG.bp$category <- ifelse(is.na(B73.only.MEG.bp$maternal_preference.PH207),"low.coverage",
+                                   ifelse(B73.only.MEG.bp$maternal_preference.PH207 > 0.75,"RER>0.75","no.imprint"))
+B73.only.MEG.bp$group <- "B73.MEG.BP"
+
+PH207.only.MEG.bp <- subset(compare.bp.syntelogs.merge,compare.bp.syntelogs.merge$filter.imprint.B73 == "no.imprint" & compare.bp.syntelogs.merge$filter.imprint.PH207 == "MEG")
+PH207.only.MEG.bp$category <- ifelse(is.na(PH207.only.MEG.bp$maternal_preference.B73),"low.coverage",
+                                   ifelse(PH207.only.MEG.bp$maternal_preference.B73 > 0.75,"RER>0.75","no.imprint"))
+PH207.only.MEG.bp$group <- "PH207.MEG.BP"
+
+
+not.enough.mat.bias <- sum(nrow(subset(B73.only.MEG.bw,B73.only.MEG.bw$maternal_preference.W22 > 0.75)),
+                           nrow(subset(W22.only.MEG.bw,W22.only.MEG.bw$maternal_preference.B73 > 0.75)))
+total.non.overlap <- sum(nrow(B73.only.MEG.bw),nrow(W22.only.MEG.bw))
+not.enough.mat.bias / total.non.overlap * 100
+
+not.enough.mat.data <- sum(nrow(subset(B73.only.MEG.bw,is.na(B73.only.MEG.bw$maternal_preference.W22))),
+                           nrow(subset(W22.only.MEG.bw,is.na(W22.only.MEG.bw$maternal_preference.B73))))
+not.enough.mat.data / total.non.overlap * 100
+
+MEG.non.overlap <- rbind(B73.only.MEG.bw[,c("group","category")],W22.only.MEG.bw[,c("group","category")],B73.only.MEG.bp[,c("group","category")],PH207.only.MEG.bp[,c("group","category")])
+plot.MEG.non.overlap <- data.frame(table(MEG.non.overlap))
+plot.MEG.non.overlap$category <- factor(plot.MEG.non.overlap$category, levels=c("no.imprint","low.coverage","RER>0.75"))
+plot.MEG.non.overlap$group <- factor(plot.MEG.non.overlap$group,levels=c("B73.MEG.BW","W22.MEG.BW","B73.MEG.BP","PH207.MEG.BP"))
+
+ggplot() + geom_bar(aes(x=group,y=Freq,fill=category),data=plot.MEG.non.overlap,stat="identity",position=position_fill()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) + scale_fill_brewer(palette="Reds")
+```
+What about PEGs? Use B73 by W22 contrast for numbers
+```{r}
+B73.only.PEG.bw <- subset(compare.bw.syntelogs.merge,compare.bw.syntelogs.merge$filter.imprint.B73 == "PEG" & compare.bw.syntelogs.merge$filter.imprint.W22 == "no.imprint")
+B73.only.PEG.bw$category <- ifelse(is.na(B73.only.PEG.bw$maternal_preference.W22),"low.coverage",
+                                   ifelse(B73.only.PEG.bw$maternal_preference.W22 < 0.25,"RER<0.25","no.imprint"))
+B73.only.PEG.bw$group <- "B73.PEG.BW"
+
+W22.only.PEG.bw <- subset(compare.bw.syntelogs.merge,compare.bw.syntelogs.merge$filter.imprint.B73 == "no.imprint" & compare.bw.syntelogs.merge$filter.imprint.W22 == "PEG")
+W22.only.PEG.bw$category <- ifelse(is.na(W22.only.PEG.bw$maternal_preference.B73),"low.coverage",
+                                   ifelse(W22.only.PEG.bw$maternal_preference.B73 < 0.25,"RER<0.25","no.imprint"))
+W22.only.PEG.bw$group <- "W22.PEG.BW"
+
+B73.only.PEG.bp <- subset(compare.bp.syntelogs.merge,compare.bp.syntelogs.merge$filter.imprint.B73 == "PEG" & compare.bp.syntelogs.merge$filter.imprint.PH207 == "no.imprint")
+B73.only.PEG.bp$category <- ifelse(is.na(B73.only.PEG.bp$maternal_preference.PH207),"low.coverage",
+                                   ifelse(B73.only.PEG.bp$maternal_preference.PH207 < 0.25,"RER<0.25","no.imprint"))
+B73.only.PEG.bp$group <- "B73.PEG.BP"
+
+PH207.only.PEG.bp <- subset(compare.bp.syntelogs.merge,compare.bp.syntelogs.merge$filter.imprint.B73 == "no.imprint" & compare.bp.syntelogs.merge$filter.imprint.PH207 == "PEG")
+PH207.only.PEG.bp$category <- ifelse(is.na(PH207.only.PEG.bp$maternal_preference.B73),"low.coverage",
+                                   ifelse(PH207.only.PEG.bp$maternal_preference.B73 < 0.25,"RER<0.25","no.imprint"))
+PH207.only.PEG.bp$group <- "PH207.PEG.BP"
+
+
+not.enough.pat.bias <- sum(nrow(subset(B73.only.PEG.bw,B73.only.PEG.bw$maternal_preference.W22 < 0.25)),
+                           nrow(subset(W22.only.PEG.bw,W22.only.PEG.bw$maternal_preference.B73 > 0.25)))
+total.non.overlap.pat <- sum(nrow(B73.only.PEG.bw),nrow(W22.only.PEG.bw))
+not.enough.pat.bias / total.non.overlap.pat * 100
+
+not.enough.pat.data <- sum(nrow(subset(B73.only.PEG.bw,is.na(B73.only.PEG.bw$maternal_preference.W22))),
+                           nrow(subset(W22.only.PEG.bw,is.na(W22.only.PEG.bw$maternal_preference.B73))))
+not.enough.pat.data / total.non.overlap.pat * 100
+
+PEG.non.overlap <- rbind(B73.only.PEG.bw[,c("group","category")],W22.only.PEG.bw[,c("group","category")],B73.only.PEG.bp[,c("group","category")],PH207.only.PEG.bp[,c("group","category")])
+plot.PEG.non.overlap <- data.frame(table(PEG.non.overlap))
+plot.PEG.non.overlap$category <- factor(plot.PEG.non.overlap$category, levels=c("no.imprint","low.coverage","RER<0.25"))
+plot.PEG.non.overlap$group <- factor(plot.PEG.non.overlap$group,levels=c("B73.PEG.BW","W22.PEG.BW","B73.PEG.BP","PH207.PEG.BP"))
+
+ggplot() + geom_bar(aes(x=group,y=Freq,fill=category),data=plot.PEG.non.overlap,stat="identity",position=position_fill()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) + scale_fill_brewer(palette="Blues")
+```
+Combined
+```{r}
+a <- ggplot() + geom_bar(aes(x=group,y=Freq,fill=category),data=plot.MEG.non.overlap,stat="identity",position=position_fill()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) + scale_fill_brewer(palette="Reds")
+b <- ggplot() + geom_bar(aes(x=group,y=Freq,fill=category),data=plot.PEG.non.overlap,stat="identity",position=position_fill()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) + scale_fill_brewer(palette="Blues")
+
+grid.arrange(a,b,nrow=1)
+```
+
+
+
+
+Create file of BW calls 
+```{r}
+tmp.meg <- subset(compare.bw.syntelogs.merge,compare.bw.syntelogs.merge$filter.imprint.B73 == "MEG" & compare.bw.syntelogs.merge$filter.imprint.W22 == "MEG")
+tmp.peg <- subset(compare.bw.syntelogs.merge,compare.bw.syntelogs.merge$filter.imprint.B73 == "PEG" & compare.bw.syntelogs.merge$filter.imprint.W22 == "PEG")
+tmp3 <- subset(compare.bw.syntelogs.merge,compare.bw.syntelogs.merge$filter.imprint.B73 != compare.bw.syntelogs.merge$filter.imprint.W22)
+
+bw.out.share <- plot.out2.bw
+bw.out.share$syntelog <- ifelse(bw.out.share$feature_type == "TE", "na.te",
+                                ifelse(bw.out.share$feature %in% gene.key.BW.syntelogs$v4_gene_model
+                                       | bw.out.share$feature %in% gene.key.BW.syntelogs$W22.Zm00004b.1., "syntelog","non.syntelog"))
+bw.out.share$imprinted.both <- ifelse(bw.out.share$syntelog == "na.te" | bw.out.share$syntelog == "non.syntelog",bw.out.share$syntelog,
+                                      ifelse(bw.out.share$feature %in% tmp.meg$feature | bw.out.share$feature %in% tmp.meg$W22.Zm00004b.1.,"both.megs",
+                                      ifelse(bw.out.share$feature %in% tmp.peg$feature | bw.out.share$feature %in% tmp.peg$W22.Zm00004b.1.,"both.pegs",
+                                             ifelse(bw.out.share$feature %in% tmp3$feature | bw.out.share$feature %in% tmp3$W22.Zm00004b.1.,"inconsistent.imprint","no.imprint"))))
+```
+
+```{r}
+tmp1 <- bw.out.share[bw.out.share$genome == "B73",c("feature","filter.imprint","syntelog","imprinted.both")]
+names(tmp1)[2:4] <- c("filter.imprint.BW","syntelog.BW","imprinted.both.BW")
+tmp2 <- plot.out2.bp[plot.out2.bp$genome == "B73",c("feature","filter.imprint")]
+names(tmp2)[2] <- "filter.imprint.BP"
+tmp2$syntelog.BP <- ifelse(nchar(tmp2$feature) == 21, "na.te",
+                                ifelse(tmp2$feature %in% gene.key.bp.syntelogs$v4_gene_model, "syntelog","non.syntelog"))
+b.both.contrasts <- merge(tmp1,tmp2,by="feature",all=T)
+b.both.contrasts$filter.imprint.BW[is.na(b.both.contrasts$filter.imprint.BW)] <- "not.detected"
+b.both.contrasts$filter.imprint.BP[is.na(b.both.contrasts$filter.imprint.BP)] <- "not.detected"
+b.both.contrasts[is.na(b.both.contrasts)] <- "NA"
+b.both.contrasts$feature_type <- ifelse(nchar(b.both.contrasts$feature) == 21, "TE","gene")
+b.both.contrasts$imprint <- ifelse(b.both.contrasts$feature_type == "TE" & (b.both.contrasts$filter.imprint.BP == "MEG" | b.both.contrasts$filter.imprint.BW == "MEG"),"matTE",
+                ifelse(b.both.contrasts$filter.imprint.BP == "MEG" | b.both.contrasts$filter.imprint.BW == "MEG","MEG",
+                                    ifelse(b.both.contrasts$feature_type == "gene" & (b.both.contrasts$filter.imprint.BP == "PEG" | b.both.contrasts$filter.imprint.BW == "PEG"),"PEG","no.imprint")))
+b.both.contrasts$syntelog <- ifelse(b.both.contrasts$feature == "TE", "na.TE",
+                                    ifelse(b.both.contrasts$feature %in% gene.key.BWP$v4_gene_model, "conserved.maize","variable"))
+table(b.both.contrasts[,c("filter.imprint.BW","filter.imprint.BP")])
+```
+What proportion of the syntelog vs non-syntelogs agree across contrasts?
+```{r}
+b.both.contrasts$agreement <- ifelse(b.both.contrasts$filter.imprint.BP == b.both.contrasts$filter.imprint.BW, "matched.call","mismatched_call")
+syntelog.agreement <- data.frame(b.both.contrasts %>% group_by(syntelog,agreement,imprint) %>% dplyr::summarise(features = n()))
+
+ggplot() + geom_bar(aes(x=syntelog,y=features,fill=agreement),data=subset(syntelog.agreement,syntelog.agreement$imprint != "no.imprint"),stat="identity",position = position_fill()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) + facet_grid(.~imprint,scales="free")
+```
+
+
+
+Compare to SNP-ASE method
+```{r}
+tmp <- subset(ase.reads2,ase.reads2$contrast == "BW" & ase.reads2$mean.count >= 10)
+names(tmp) <- c("gid","ase.contrast","ase.BW.ratio","ase.BW.count")
+bw.merge <- merge(plot.out2.bw,tmp,by.x="feature",by.y="gid",all.x=T)
+tmp2 <- subset(ase.reads2,ase.reads2$contrast == "WB" & ase.reads2$mean.count >= 10)
+names(tmp2) <- c("gid","ase.contrast","ase.WB.ratio","ase.WB.count")
+bw.merge2 <- merge(bw.merge,tmp2,by.x="feature",by.y="gid",all.x=T)
+
+bw.merge2$genotype.biased <- ifelse(bw.merge2$ase.BW.ratio >= 0.9 & bw.merge2$ase.WB.ratio <= 0.1, "B73.biased",ifelse(bw.merge2$ase.WB.ratio >= 0.9 & bw.merge2$ase.BW.ratio <= 0.1,"W22.biased","fine"))
+bw.merge2$group <- factor(ifelse(bw.merge2$genotype.biased == "fine",bw.merge2$filter.imprint,bw.merge2$genotype.biased),levels = c("B73.biased","W22.biased","MEG","PEG","no.imprint"))
+
+a <- ggExtra::ggMarginal(ggplot(bw.merge2,aes(x=ase.BW.ratio,y=maternal_preference)) + theme_classic() + geom_point(aes(color = group,alpha = 0.5)) + xlab("SNP-ASE BxW") + ylab("RER") + theme(legend.position="none") + scale_color_manual(values = c("darkgreen","purple4","magenta","blue","gray")),type="histogram")
+
+b <- ggExtra::ggMarginal(ggplot(bw.merge2,aes(x=ase.WB.ratio,y=maternal_preference)) + theme_classic() + geom_point(aes(color = group,alpha = 0.5)) + xlab("SNP-ASE WxB") + ylab("RER") + theme(legend.position="none") + scale_color_manual(values = c("darkgreen","purple4","magenta","blue","gray")),type="histogram")
+
+c <- ggExtra::ggMarginal(ggplot(bw.merge2,aes(x=ase.BW.ratio,y=ase.WB.ratio)) + theme_classic() + geom_point(aes(color = group,alpha = 0.5)) + xlab("SNP-ASE WxB") + ylab("SNP-ASE BxW") + theme(legend.position="none") + scale_color_manual(values = c("darkgreen","purple4","magenta","blue","gray")),type="histogram")
+
+grid.arrange(a,b,c,nrow=2)
+```
+
+
+
+B73 vs W22
+```{r}
+a <- ggplot(bw.merge2,aes(x=ase.BW.ratio,y=maternal_preference)) + geom_bin2d(bins = 50) + theme_classic() + scale_fill_viridis_c(option = "inferno") + xlab("SNP-ASE BxW") + ylab("RER")
+b <- ggplot(bw.merge2,aes(x=ase.WB.ratio,y=maternal_preference)) + geom_bin2d(bins = 50) + theme_classic() + scale_fill_viridis_c(option = "inferno") + xlab("SNP-ASE WxB") + ylab("RER")
+
+grid.arrange(a,b,nrow=1)
+```
+Compare B73 vs PH207
+```{r}
+bp.merged.out <- merge(plot.out2.bp,subset(ase.reads2,ase.reads2$contrast == "BP"),by.x="feature",by.y="gid",all=F)
+bp.merged.out2 <- subset(bp.merged.out,bp.merged.out$mean.count >= 10)
+a <- ggplot(bp.merged.out2,aes(x=mean.ratio,y=maternal_preference)) + geom_bin2d(bins = 50) + theme_classic() + scale_fill_viridis_c(option = "inferno") + xlab("Mean SNP Maternal Ratio BxW") + ylab("Maternal Preference Ratio")
+
+bp.merged.out3 <- merge(plot.out2.bp,subset(ase.reads2,ase.reads2$contrast == "PB"),by.x="feature",by.y="gid",all=F)
+bp.merged.out4 <- subset(bp.merged.out3,bp.merged.out3$mean.count >= 10)
+
+b <- ggplot(bp.merged.out4,aes(x=mean.ratio,y=maternal_preference)) + geom_bin2d(bins = 50) + theme_classic() + scale_fill_viridis_c(option = "inferno") + xlab("Mean SNP Maternal Ratio WxB") + ylab("Maternal Preference Ratio")
+
+grid.arrange(a,b,nrow=1)
+```
+
+
+
+
+
+Plot just genes
+```{r}
+plot.just.genes <- rbind(subset(plot.out2.bw,plot.out2.bw$feature_type == "gene"),subset(plot.out2.bp,plot.out2.bp$feature_type == "gene"),subset(plot.out2.wp,plot.out2.wp$feature_type == "gene"))
+
+ggplot(plot.just.genes,aes(x=imprint,y=maternal_preference,fill=imprint)) + geom_violin() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + facet_grid(genome~contrast) + geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + stat_summary(fun.data = give.n, geom = "text") 
+
+table(plot.just.genes[,c("genome","contrast","imprint")])
+```
+
+```{r}
+meg.genes <- subset(b.both.contrasts,b.both.contrasts$imprint == "MEG")
+length(meg.genes$feature[duplicated(meg.genes$feature)])
+length(unique(meg.genes$feature))
+```
+```{r}
+peg.genes <- subset(b.both.contrasts,b.both.contrasts$imprint == "PEG")
+length(peg.genes$feature[duplicated(peg.genes$feature)])
+length(unique(peg.genes$feature))
+```
+```{r}
+meg.tes <- subset(b.both.contrasts,b.both.contrasts$imprint == "matTE")
+length(meg.tes$feature[duplicated(meg.tes$feature)])
+length(unique(meg.tes$feature))
+```
+
+Check endosperm vs pericarp expression, especially for MEGs
+```{r}
+unfiltered.meg.genes <- subset(b.both.contrasts,b.both.contrasts$feature_type == "gene" & (b.both.contrasts$filter.imprint.BW == "MEG" | b.both.contrasts$filter.imprint.BW == "filtered.MEG"))
+
+imprinted.meg.4heat <- as.matrix(subset(dev.rpm, rownames(dev.rpm) %in% unfiltered.meg.genes$feature & rowMaxs(as.matrix(dev.rpm[,keep.columns])) > 0)[,keep.columns])
+pheatmap((imprinted.meg.4heat/rowMaxs(imprinted.meg.4heat)),border_color = NA,fontsize = 8,cluster_cols = F)
+```
+```{r}
+a <- subset(imprinted.meg.4heat,rownames(imprinted.meg.4heat) %in% rownames(peri.preferred))/rowMaxs(subset(imprinted.meg.4heat,rownames(imprinted.meg.4heat) %in% rownames(peri.preferred)))
+b <- subset(imprinted.meg.4heat,!rownames(imprinted.meg.4heat) %in% rownames(peri.preferred))/rowMaxs(subset(imprinted.meg.4heat,!rownames(imprinted.meg.4heat) %in% rownames(peri.preferred)))
+imprinted.meg.4heat.v2 <- rbind(a[order(rowMeans(a),decreasing = T),],b[order(rowMeans(b),decreasing = T),])
+pheatmap((imprinted.meg.4heat.v2/rowMaxs(imprinted.meg.4heat.v2)),border_color = NA,fontsize = 8,cluster_cols = F,cluster_rows = F,show_rownames = F,gaps_row = nrow(a))
+```
+
+
+Check for TEs
+```{r}
+peri.te.heat <- as.matrix(subset(dev.rpm, rownames(dev.rpm) %in% meg.tes$feature & rowMaxs(as.matrix(dev.rpm[,keep.columns])) > 0)[,keep.columns])
+pheatmap((peri.te.heat/rowMaxs(peri.te.heat)),border_color = NA,fontsize = 8,cluster_cols = F)
+```
+```{r}
+peri.te.heat.v2 <- peri.te.heat/rowMaxs(peri.te.heat)
+pheatmap((peri.te.heat.v2[order(rowMeans(peri.te.heat.v2),decreasing = T),]),border_color = NA,fontsize = 8,cluster_cols = F,cluster_rows = F,show_rownames = F)
+```
+
+Plot just TEs
+```{r}
+plot.just.tes <- rbind(subset(plot.out2.bw,plot.out2.bw$feature_type == "TE"),subset(plot.out2.bp,plot.out2.bp$feature_type == "TE"),subset(plot.out2.wp,plot.out2.wp$feature_type == "TE"))
+
+ggplot(plot.just.tes,aes(x=imprint,y=maternal_preference,fill=imprint)) + geom_violin() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + facet_grid(genome~contrast) + geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + stat_summary(fun.data = give.n, geom = "text") 
+
+table(plot.just.tes[,c("genome","contrast","filter.imprint")])
+```
+
+
+
+Make distribution of all based on which libraries got included in DE calls
+```{r}
+imp.recips.rpm2 <- data.frame(rbind(subset(imp.BvW.rpm,imp.BvW.rpm$feature %in% rownames(imp.all.de.keep.bw)),subset(imp.BvP.rpm,imp.BvP.rpm$feature %in% rownames(imp.all.de.keep.bp)),subset(imp.WvP.rpm,imp.WvP.rpm$feature %in% rownames(imp.all.de.keep.wp))))
+
+imp.recips.rpm2$A_mean <- rowMeans(imp.recips.rpm2[,1:3])
+imp.recips.rpm2$B_mean <- rowMeans(imp.recips.rpm2[,4:6])
+imp.recips.rpm2$maternal_preference <- ifelse(imp.recips.rpm2$type == "A",imp.recips.rpm2$A_mean/(imp.recips.rpm2$A_mean + imp.recips.rpm2$B_mean),imp.recips.rpm2$B_mean/(imp.recips.rpm2$A_mean + imp.recips.rpm2$B_mean)) # maternal preferance calculation
+
+ggplot(imp.recips.rpm2,aes(x=genome,y=maternal_preference,fill=genome)) + geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + geom_violin() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + facet_wrap(feature_type~contrast,scales="free_x") + stat_summary(fun.data = give.n, geom = "text") 
+```
+Plot as stacked bars instead
+```{r}
+imp.recips.rpm2$mat.category <- factor(ifelse(imp.recips.rpm2$maternal_preference > 0.9, "strong.maternal",
+                                       ifelse(imp.recips.rpm2$maternal_preference < 0.1, "strong.paternal",
+                                              ifelse(imp.recips.rpm2$maternal_preference > 0.8, "moderate.maternal",
+                                                     ifelse(imp.recips.rpm2$maternal_preference < 0.2, "moderate.paternal", "biparental")))),
+                                      levels = c("strong.maternal","moderate.maternal","biparental","moderate.paternal","strong.paternal"))
+imp.recips.rpm2$feature_category <- factor(ifelse(imp.recips.rpm2$feature_type == "TE","TE",
+                                           ifelse(imp.recips.rpm2$feature %in% gene.key.BWP$v4_gene_model 
+                                                  | imp.recips.rpm2$feature %in% gene.key.BWP$W22.Zm00004b.1. 
+                                                  | imp.recips.rpm2$feature %in% gene.key.BWP$PH207.Zm00008a.1., "maize.syntenic.gene","maize.nonsyntenic.gene")),
+                                           levels=c("maize.syntenic.gene","maize.nonsyntenic.gene","TE"))
+stack.mat.category <- data.frame(imp.recips.rpm2 %>% group_by(feature_category,genome,contrast,mat.category) %>% dplyr::summarise(n = n()) %>% dplyr::mutate(proportion = n/sum(n)))
+stack.mat.category$sample <- paste(stack.mat.category$genome,stack.mat.category$contrast,sep="_")
+ggplot() + geom_bar(aes(x=sample,y=proportion,fill=mat.category),data=stack.mat.category,stat="identity",position = position_fill()) + theme_classic() + scale_fill_manual(values=c("magenta","magenta4","darkgray","navy","blue")) + facet_wrap(.~feature_category,scales="free") + theme(axis.text.x = element_text(angle=90, hjust=1)) 
+```
+proportion.strong - syntenic genes
+```{r}
+tmp <- subset(stack.mat.category,stack.mat.category$feature_category == "maize.syntenic.gene" & grepl("strong",stack.mat.category$mat.category))
+tmp2 <- data.frame(tmp %>% group_by(sample) %>% dplyr::summarise(strong.parental = sum(proportion)))
+mean(tmp2$strong.parental)
+```
+TEs
+```{r}
+tmp <- subset(stack.mat.category,stack.mat.category$feature_category == "TE" & grepl("strong",stack.mat.category$mat.category))
+tmp2 <- data.frame(tmp %>% group_by(sample) %>% dplyr::summarise(strong.parental = sum(proportion)))
+mean(tmp2$strong.parental)
+```
+nonsyntenic genes
+```{r}
+tmp <- subset(stack.mat.category,stack.mat.category$feature_category == "maize.nonsyntenic.gene" & grepl("strong",stack.mat.category$mat.category))
+tmp2 <- data.frame(tmp %>% group_by(sample) %>% dplyr::summarise(strong.parental = sum(proportion)))
+mean(tmp2$strong.parental)
+```
+
+```{r}
+ggplot(imp.recips.rpm2,aes(x=genome,y=maternal_preference,fill=genome)) + geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + geom_violin() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + facet_wrap(feature_category~contrast,scales="free_x") + stat_summary(fun.data = give.n, geom = "text") 
+```
+
+
+```{r}
+gene.key.BWP$B.imp.BW <- ifelse(gene.key.BWP$v4_gene_model %in% subset(plot.out2.bw,plot.out2.bw$category != "notDE")[,"feature"],"imprinted",ifelse(gene.key.BWP$v4_gene_model %in% plot.out2.bw$feature,"not.imprinted","NA"))
+gene.key.BWP$W.imp.BW <- ifelse(gene.key.BWP$W22.Zm00004b.1. %in% subset(plot.out2.bw,plot.out2.bw$category != "notDE")[,"feature"],"imprinted",ifelse(gene.key.BWP$W22.Zm00004b.1. %in% plot.out2.bw$feature,"not.imprinted","NA"))
+
+gene.key.BWP$B.imp.BP <- ifelse(gene.key.BWP$v4_gene_model %in% subset(plot.out2.bp,plot.out2.bp$category != "notDE")[,"feature"],"imprinted",ifelse(gene.key.BWP$v4_gene_model %in% plot.out2.bp$feature,"not.imprinted","NA"))
+gene.key.BWP$P.imp.BP <- ifelse(gene.key.BWP$PH207.Zm00008a.1. %in% subset(plot.out2.bp,plot.out2.bp$category != "notDE")[,"feature"],"imprinted",ifelse(gene.key.BWP$PH207.Zm00008a.1. %in% plot.out2.bp$feature,"not.imprinted","NA"))
+
+gene.key.BWP$P.imp.WP <- ifelse(gene.key.BWP$PH207.Zm00008a.1. %in% subset(plot.out2.wp,plot.out2.wp$category != "notDE")[,"feature"],"imprinted",ifelse(gene.key.BWP$PH207.Zm00008a.1. %in% plot.out2.wp$feature,"not.imprinted","NA"))
+gene.key.BWP$W.imp.WP <- ifelse(gene.key.BWP$W22.Zm00004b.1. %in% subset(plot.out2.wp,plot.out2.wp$category != "notDE")[,"feature"],"imprinted",ifelse(gene.key.BWP$W22.Zm00004b.1. %in% plot.out2.wp$feature,"not.imprinted","NA"))
+```
+
+Look at endosperm-specific expression vs constituative expression
+```{r}
+endo.seed.columns <- c(names(dev.rpm)[grep("endosperm",names(dev.rpm))],names(dev.rpm)[grep("seed",names(dev.rpm))])
+other.columns <- names(dev.rpm)[!names(dev.rpm) %in% endo.seed.columns]
+other.columns <- other.columns[order(other.columns)]
+endo.preferred <- rownames(subset(dev.rpm,rowSums(dev.rpm[,endo.seed.columns])/rowSums(dev.rpm) > 0.6))
+plot.column.order <- c(endo.seed.columns,other.columns)
+```
+
+Summarize features further
+```{r}
+b.both.contrasts$expression.type <- ifelse(b.both.contrasts$feature %in% endo.preferred, "endo.preferred","constitutive")
+```
+
+MEG genes
+```{r}
+imprinted.meg.4heat <- as.matrix(subset(dev.rpm, rownames(dev.rpm) %in% meg.genes$feature))
+
+a <- subset(imprinted.meg.4heat,rownames(imprinted.meg.4heat) %in% endo.preferred)
+b <- subset(imprinted.meg.4heat,!rownames(imprinted.meg.4heat) %in% endo.preferred)
+c <- rbind(a,b)
+
+pheatmap((a/rowMaxs(a))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,clustering_distance_rows = "euclidean")
+pheatmap((b/rowMaxs(b))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,clustering_distance_rows = "euclidean")
+pheatmap((c/rowMaxs(c))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,cluster_rows = F,gaps_col = length(endo.seed.columns),gaps_row = nrow(a),show_rownames = F,show_colnames = F, main = "Developmental Expression of MEGs")
+meg.dev <- pheatmap((c/rowMaxs(c))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,cluster_rows = F,gaps_col = length(endo.seed.columns),gaps_row = nrow(a),show_rownames = F,show_colnames = F, main = "Developmental Expression of MEGs")
+```
+
+PEG genes
+```{r}
+imprinted.peg.4heat <- as.matrix(subset(dev.rpm, rownames(dev.rpm) %in% peg.genes$feature))
+
+a <- subset(imprinted.peg.4heat,rownames(imprinted.peg.4heat) %in% endo.preferred)
+b <- subset(imprinted.peg.4heat,!rownames(imprinted.peg.4heat) %in% endo.preferred)
+c <- rbind(a,b)
+
+pheatmap((a/rowMaxs(a))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,clustering_distance_rows = "euclidean")
+pheatmap((b/rowMaxs(b))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,clustering_distance_rows = "euclidean")
+pheatmap((c/rowMaxs(c))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,cluster_rows = F,gaps_col = length(endo.seed.columns),gaps_row = nrow(a),show_rownames = F,show_colnames = F, main = "Developmental Expression of PEGs")
+peg.dev <- pheatmap((c/rowMaxs(c))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,cluster_rows = F,gaps_col = length(endo.seed.columns),gaps_row = nrow(a),show_rownames = F,show_colnames = F, main = "Developmental Expression of PEGs")
+```
+maternal TEs
+```{r}
+imprinted.te.4heat <- as.matrix(subset(dev.rpm, rownames(dev.rpm) %in% meg.tes$feature))
+
+a <- subset(imprinted.te.4heat,rownames(imprinted.te.4heat) %in% endo.preferred)
+b <- subset(imprinted.te.4heat,!rownames(imprinted.te.4heat) %in% endo.preferred)
+c <- rbind(a,b)
+
+pheatmap((a/rowMaxs(a))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,clustering_distance_rows = "euclidean")
+pheatmap((b/rowMaxs(b))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,clustering_distance_rows = "euclidean")
+pheatmap((c/rowMaxs(c))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,cluster_rows = F,gaps_col = length(endo.seed.columns),gaps_row = nrow(a),show_rownames = F,show_colnames = T, main = "Developmental Expression of matTEs")
+matTE.dev <- pheatmap((c/rowMaxs(c))[,plot.column.order],border_color = NA,fontsize = 8,cluster_cols = F,cluster_rows = F,gaps_col = length(endo.seed.columns),gaps_row = nrow(a),show_rownames = F,show_colnames = T, main = "Developmental Expression of matTEs")
+```
+
+
+
+
+Stacked bar with imprinted features, syntelog, expression.type
+```{r}
+of.interest <- subset(b.both.contrasts,b.both.contrasts$imprint != "no.imprint")
+of.interest2 <- data.frame(of.interest %>% group_by(imprint,syntelog,expression.type) %>% dplyr::summarise(features = n()))
+of.interest2$type <- factor(ifelse(of.interest2$imprint == "matTE", "matTE",paste(of.interest2$imprint,of.interest2$syntelog,sep="_")),
+                            levels=c("PEG_conserved.maize","PEG_variable","MEG_conserved.maize","MEG_variable","matTE"))
+of.interest2$expression.type <- factor(of.interest2$expression.type,levels=c("endo.preferred","constitutive"))
+
+ggplot() + geom_bar(aes(x=type,y=features,fill=expression.type),data=of.interest2,stat="identity",position = position_fill()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) + scale_fill_manual(values=c("darkorange","honeydew4")) 
+```
+
+Binding sites
+Find binding sites from Batista et al. in B73
+Convert sites to meme file
+module load meme/4.12.0-py2-openmpi3-qbrm5zn
+iupac2meme TTWCCATATW > batista_motif1_meme.txt
+iupac2meme CCAWAAATGG > batista_motif2_meme.txt
+cat batista_motif1_meme.txt batista_motif2_meme.txt > batista_motifs_meme.txt
+module load bedtools2/2.27.1-s2mtpsu
+cut -f 1,4,5,9 B73.structuralTEv2.2018.12.20.filteredTE.disjoined.gff3 | bedtools getfasta -name -fi Zea_mays.AGPv4.dna.toplevel.fa -bed - -fo B73v4.disjoinedTE.fa
+fimo batista_motifs_meme.txt B73v4.disjoinedTE.fa > fimo.txt
+cp fimo_out/fimo.txt batista_motifs_fimo_out.txt
+
+grep gene Zea_mays.AGPv4.33.gff3 | cut -f 1,4,5,9 - | bedtools getfasta -name -fi Zea_mays.AGPv4.dna.toplevel.fa -bed - -fo B73v4.gene.fa
+fimo batista_motifs_meme.txt B73v4.gene.fa 
+cp fimo_out/fimo.txt batista_motifs_fimo_gene_out.txt
+
+```{r}
+all.sites <- read.table("batista_motifs_fimo_out.txt",header=F,stringsAsFactors = F,sep="\t")
+all.sites$te <- substr(all.sites$V3,4,24)
+sites.per.te <- data.frame(all.sites %>% group_by(te) %>% dplyr::summarise(motif1 = sum(V1 == "TTWCCATATW"),motif2 = sum(V1 == "CCAWAAATGG")))
+sites.per.te$motif.type <- ifelse(sites.per.te$motif1 > 0 & sites.per.te$motif2 > 0, "both",
+                                  ifelse(sites.per.te$motif1 > 0, "motif1","motif2"))
+names(sites.per.te)[1] <- "feature"
+sites.per.te$feature_type <- "TE"
+```
+
+Gene binding sites
+```{r}
+gene.sites <- read.table("batista_motifs_fimo_gene_out.txt",header=F,stringsAsFactors = F,sep="\t")
+gene.sites$gene <- substr(gene.sites$V3,4,17)
+gene.sites2 <- subset(gene.sites,!grepl("GRMZM",gene.sites$gene))
+sites.per.gene <- data.frame(gene.sites2 %>% group_by(gene) %>% dplyr::summarise(motif1 = sum(V1 == "TTWCCATATW"),motif2 = sum(V1 == "CCAWAAATGG")))
+sites.per.gene$motif.type <- ifelse(sites.per.gene$motif1 > 0 & sites.per.gene$motif2 > 0, "both",
+                                  ifelse(sites.per.gene$motif1 > 0, "motif1","motif2"))
+names(sites.per.gene)[1] <- "feature"
+sites.per.gene$feature_type <- "gene"
+```
+
+```{r}
+sites.per.feature <- data.frame(rbind(sites.per.gene,sites.per.te))
+#write.table(sites.per.feature,file="PHE1_binding_sites_genesTEs.txt",quote=F,sep="\t",row.names = F)
+```
+
+```{r}
+sites.per.feature <- read.table("PHE1_binding_sites_genesTEs.txt",sep = "\t",stringsAsFactors = F,header=T)
+```
+
+
+```{r}
+b.both.contrasts$motif1 <- b.both.contrasts$feature %in% subset(sites.per.feature,sites.per.feature$motif1 > 0)[,"feature"]
+b.both.contrasts$motif2 <- b.both.contrasts$feature %in% subset(sites.per.feature,sites.per.feature$motif2 > 0)[,"feature"]
+b.both.contrasts$motif.type <- ifelse(b.both.contrasts$motif1 & b.both.contrasts$motif2, "both",
+                                      ifelse(b.both.contrasts$motif1, "motif1",ifelse(b.both.contrasts$motif2,"motif2","no.motif")))
+table(b.both.contrasts$motif.type)
+```
+
+```{r}
+sites.summary <- data.frame(b.both.contrasts %>% group_by(imprint,motif.type) %>% dplyr::summarise(n = n()) %>% dplyr::mutate(freq = n/sum(n)))
+
+ggplot() + geom_bar(aes(x=imprint,y=n,fill=motif.type),data=sites.summary,stat="identity",position = position_fill()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) +  scale_fill_brewer(palette = "YlGnBu")
+ggplot() + geom_bar(aes(x=imprint,y=freq,fill=motif.type),data=sites.summary,stat="identity",position = position_dodge()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) +  scale_fill_brewer(palette = "YlGnBu")
+
+b.both.contrasts$either.motif <- ifelse(b.both.contrasts$motif.type == "no.motif","no.motif","has.motif")
+sites.summary2 <- data.frame(b.both.contrasts %>% group_by(imprint,either.motif) %>% dplyr::summarise(n = n()) %>% dplyr::mutate(freq = n/sum(n)))
+sites.summary2
+```
+
+Look at per TE fam 
+```{r}
+te.both.contrasts <- subset(b.both.contrasts,b.both.contrasts$imprint == "matTE")
+te.both.contrasts$fam <- substr(te.both.contrasts$feature,0,8)
+
+tmp <- data.frame(table(te.both.contrasts$fam))
+tmp2 <- subset(tmp,tmp$Freq>1)
+
+site.te.summary <- data.frame(subset(te.both.contrasts,te.both.contrasts$fam %in% tmp2$Var1) %>% group_by(motif.type,fam) %>% dplyr::summarise(features = n()))
+
+ggplot() + geom_bar(aes(x=fam,y=features,fill=motif.type),data=site.te.summary,stat="identity",position = position_fill()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) 
+```
+DHH2
+```{r}
+DHH2.both.contrasts <- subset(b.both.contrasts,grepl("DHH00002",b.both.contrasts$feature))
+
+DHH2.not.expressed <- subset(imp.all,grepl("DHH00002Zm00001d",imp.all$ID) & !imp.all$ID %in% b.both.contrasts$feature)
+DHH2.not.expressed2 <- data.frame(matrix(ncol=ncol(DHH2.both.contrasts),nrow=nrow(DHH2.not.expressed)))
+colnames(DHH2.not.expressed2) <- colnames(DHH2.both.contrasts)
+DHH2.not.expressed2$feature <- DHH2.not.expressed$ID
+DHH2.not.expressed2$imprint <- "not.detected"
+
+DHH2.both.contrasts2 <- rbind(DHH2.both.contrasts,DHH2.not.expressed2)
+
+DHH2.both.sites <- merge(DHH2.both.contrasts2,sites.per.feature,by="feature",all.x=T)
+names(DHH2.both.sites) <- gsub(".y",".sites",names(DHH2.both.sites),fixed = T)
+
+DHH2.both.sites$motif1.sites[is.na(DHH2.both.sites$motif1.sites)] <- 0
+DHH2.both.sites$motif2.sites[is.na(DHH2.both.sites$motif2.sites)] <- 0
+DHH2.both.sites$motif.type <- ifelse(DHH2.both.sites$motif1.sites > 0 & DHH2.both.sites$motif2.sites > 0, "both",
+                                      ifelse(DHH2.both.sites$motif1.sites > 0, "motif1",ifelse(DHH2.both.sites$motif2.sites > 0,"motif2","no.motif")))
+
+site.dhh.summary <- data.frame(DHH2.both.sites %>% group_by(motif.type,imprint) %>% dplyr::summarise(features = n()))
+
+ggplot() + geom_bar(aes(x=imprint,y=features,fill=motif.type),data=site.dhh.summary,stat="identity",position = position_fill()) + theme_classic()  +  theme(axis.text.x = element_text(angle=90, hjust=1)) + scale_fill_brewer(palette = "YlGnBu")
+
+ggplot(DHH2.both.sites,aes(x=imprint,y=motif1.sites,fill=imprint)) + geom_boxplot() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + stat_summary(fun.data = give.n, geom = "text") 
+ggplot(DHH2.both.sites,aes(x=imprint,y=motif2.sites,fill=imprint)) + geom_boxplot() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + stat_summary(fun.data = give.n, geom = "text") 
+```
+
+
+
+
+```{r}
+b.both.contrasts$imprint.syntelog <- paste(b.both.contrasts$imprint,b.both.contrasts$syntelog,sep="_")
+gene.key.syntenic.grasses <- subset(gene.key,nchar(gene.key$sorghum_ortholog) > 0 & nchar(gene.key$foxtail_millet_ortholog) > 0 & nchar(gene.key$rice_ortholog) > 0 & nchar(gene.key$brachypodium_ortholog) > 0)
+b.both.contrasts$syntenic.grasses <- ifelse(b.both.contrasts$feature_type == "TE","NA.TE",ifelse(b.both.contrasts$feature %in% gene.key.syntenic.grasses$v4_gene_model, "syntenic.grasses","nonsyntenic.grasses"))
+table(b.both.contrasts[,c("imprint","syntenic.grasses","syntelog")])
+
+summarize.synteny1 <- data.frame(subset(b.both.contrasts,b.both.contrasts$feature_type == "gene") %>% group_by(imprint,syntelog) %>% dplyr::summarize(n=n()) %>% dplyr::mutate(freq=n/sum(n)))
+
+a <- ggplot() + geom_bar(aes(x=imprint,y=freq,fill=syntelog),data=subset(summarize.synteny1,summarize.synteny1$syntelog == "PAV"),stat="identity",position = position_dodge()) + theme_classic() + scale_fill_manual(values = c("green")) +  theme(axis.text.x = element_text(angle=90, hjust=1)) + ggtitle("Nonsyntenic within maize")+ theme(legend.position = "none") + ylim(c(0,1))
+
+summarize.synteny2 <- data.frame(subset(b.both.contrasts,b.both.contrasts$feature_type == "gene") %>% group_by(imprint,syntenic.grasses) %>% dplyr::summarize(n=n()) %>% dplyr::mutate(freq=n/sum(n)))
+
+b <- ggplot() + geom_bar(aes(x=imprint,y=freq,fill=syntenic.grasses),data=subset(summarize.synteny2,summarize.synteny2$syntenic.grasses == "nonsyntenic.grasses"),stat="identity",position = position_dodge()) + theme_classic() + scale_fill_manual(values = c("forestgreen")) +  theme(axis.text.x = element_text(angle=90, hjust=1))  + ggtitle("Nonsyntenic within grasses")+ theme(legend.position = "none") + ylim(c(0,1))
+
+grid.arrange(a,b,nrow=1)
+```
+
+How many imprinted genes have GO terms?
+File downloaded from AGRIGO using link: http://systemsbiology.cau.edu.cn/agriGOv2/download/958_slimGO on 20 Feb 2020
+```{r}
+gene.go <- read.table("B73v4_slimGO.txt",header=F,sep="\t",stringsAsFactors = F)
+gene.go <- gene.go[,3:4]
+names(gene.go) <- c("gene","term")
+```
+
+```{r}
+b.both.contrasts$has.go.term <- factor(ifelse(b.both.contrasts$feature_type == "TE", "NA.TE",
+                                       ifelse(b.both.contrasts$feature %in% gene.go$gene, "GO.term(s)","no.GO")),levels=c("GO.term(s)","no.GO"))
+summarize.go <- data.frame(subset(b.both.contrasts,b.both.contrasts$feature_type == "gene") %>% group_by(imprint.syntelog,has.go.term,) %>% dplyr::summarise(n = n()) %>% dplyr::mutate(freq = n/sum(n)))
+
+ggplot() + geom_bar(aes(x=imprint.syntelog,y=freq,fill=has.go.term),data=subset(summarize.go,summarize.go$has.go.term == "no.GO"),stat="identity",position = position_dodge()) + theme_classic() + scale_fill_manual(values = c("purple")) +  theme(axis.text.x = element_text(angle=90, hjust=1)) + ggtitle("Genes without GO term")+ theme(legend.position = "none") 
+```
+
+```{r}
+b.both.contrasts.genes <- subset(b.both.contrasts,b.both.contrasts$feature_type == "gene")
+b.both.alluv <- data.frame(subset(b.both.contrasts.genes,b.both.contrasts.genes$imprint != "no.imprint") %>% group_by(imprint,syntelog,syntenic.grasses,has.go.term) %>% dplyr::summarise(n=n()))
+ggplot(data=b.both.alluv,
+       aes(axis4 = imprint,axis3=syntelog,axis2=syntenic.grasses,axis1=has.go.term,y=n)) + 
+  scale_x_discrete(limits = rev(c("imprint","syntelog", "syntenic.grasses", "has.go.term")), expand = c(.1, .05)) +
+  xlab("features") +
+  geom_alluvium(aes(fill = imprint)) +
+  geom_stratum() + geom_text(stat = "stratum", infer.label = TRUE) + coord_flip()+
+  theme_classic() + scale_fill_manual(values=c("magenta3","navy")) 
+```
+
+```{r}
+b.both.alluv2 <- data.frame(subset(b.both.contrasts.genes,b.both.contrasts.genes$imprint != "no.imprint") %>% group_by(imprint,syntelog,has.go.term) %>% dplyr::summarise(n=n()))
+ggplot(data=b.both.alluv2,
+       aes(axis3 = imprint,axis2=syntelog,axis1=has.go.term,y=n)) +
+  scale_x_discrete(limits = rev(c("imprint","syntelog", "has.go.term")), expand = c(.1, .05)) +
+  xlab("features") +
+  geom_alluvium(aes(fill = imprint)) +
+  geom_stratum() + geom_text(stat = "stratum", infer.label = TRUE) + coord_flip()+
+  theme_classic() + scale_fill_manual(values=c("magenta3","navy")) 
+
+```
+
+```{r}
+b.both.alluv2b <- data.frame(b.both.contrasts.genes %>% group_by(imprint,syntenic.grasses,has.go.term,expression.type) %>% dplyr::summarise(n=n()))
+b.both.alluv2b$syntenic.grasses <- factor(b.both.alluv2b$syntenic.grasses,levels=c("nonsyntenic.grasses","syntenic.grasses"))
+b.both.alluv2b$has.go.term <- factor(b.both.alluv2b$has.go.term,levels=c("no.GO","GO.term(s)"))
+b.both.alluv2b$expression.type <- factor(b.both.alluv2b$expression.type,levels=c("endo.preferred","constitutive"))
+
+ggplot(data=b.both.alluv2b,
+       aes(axis4 = imprint,axis3=syntenic.grasses,axis2=has.go.term,axis1=expression.type,y=n)) +
+  scale_x_discrete(limits = rev(c("imprint","syntenic.grasses", "has.go.term","expression.type")), expand = c(.1, .05)) +
+  xlab("features") +
+  geom_alluvium(aes(fill = syntenic.grasses)) +
+  geom_stratum() + geom_text(stat = "stratum", infer.label = TRUE) + coord_flip()+
+  theme_classic() + scale_fill_manual(values=c("green","steelblue")) + facet_grid(.~imprint,scales="free")
+```
+Stats for above -  chisquared test
+```{r}
+m.stats <- subset(b.both.alluv2b,b.both.alluv2b$imprint %in% c("MEG","no.imprint"))
+a <- data.frame(m.stats %>% group_by(imprint,syntenic.grasses) %>% dplyr::summarise(n=sum(n)) %>% pivot_wider(names_from = syntenic.grasses, values_from = n))
+a$percent <- a$syntenic.grasses/rowSums(a[,2:3])
+chisq.test(a[,2:3])
+
+b <- data.frame(m.stats %>% group_by(imprint,has.go.term) %>% dplyr::summarise(n=sum(n)) %>% pivot_wider(names_from = has.go.term, values_from = n))
+b$percent <- b$no.GO/rowSums(b[,2:3])
+chisq.test(b[,2:3])
+
+c <- data.frame(m.stats %>% group_by(imprint,expression.type) %>% dplyr::summarise(n=sum(n)) %>% pivot_wider(names_from = expression.type, values_from = n))
+c$percent <- c$endo.preferred/rowSums(c[,2:3])
+chisq.test(c[,2:3])
+
+p.stats <- subset(b.both.alluv2b,b.both.alluv2b$imprint %in% c("PEG","no.imprint"))
+d <- data.frame(p.stats %>% group_by(imprint,syntenic.grasses) %>% dplyr::summarise(n=sum(n)) %>% pivot_wider(names_from = syntenic.grasses, values_from = n))
+d$percent <- d$syntenic.grasses/rowSums(d[,2:3])
+chisq.test(d[,2:3])
+
+e <- data.frame(p.stats %>% group_by(imprint,has.go.term) %>% dplyr::summarise(n=sum(n)) %>% pivot_wider(names_from = has.go.term, values_from = n))
+e$percent <- e$no.GO/rowSums(e[,2:3])
+chisq.test(e[,2:3])
+
+f <- data.frame(p.stats %>% group_by(imprint,expression.type) %>% dplyr::summarise(n=sum(n)) %>% pivot_wider(names_from = expression.type, values_from = n))
+f$percent <- f$endo.preferred/rowSums(f[,2:3])
+chisq.test(f[,2:3])
+```
+Version 2
+```{r}
+b.both.alluv2b <- data.frame(b.both.contrasts.genes %>% group_by(imprint,syntelog,syntenic.grasses,expression.type) %>% dplyr::summarise(n=n()))
+b.both.alluv2b$syntenic.grasses <- factor(b.both.alluv2b$syntenic.grasses,levels=c("nonsyntenic.grasses","syntenic.grasses"))
+b.both.alluv2b$syntelog <- factor(b.both.alluv2b$syntelog,levels=c("variable","conserved.maize"))
+b.both.alluv2b$expression.type <- factor(b.both.alluv2b$expression.type,levels=c("endo.preferred","constitutive"))
+
+ggplot(data=b.both.alluv2b,
+       aes(axis4 = imprint,axis3 = syntelog,axis2=syntenic.grasses,axis1=expression.type,y=n)) +
+  scale_x_discrete(limits = rev(c("imprint","syntelog","syntenic.grasses","expression.type")), expand = c(.1, .05)) +
+  xlab("features") +
+  geom_alluvium(aes(fill = syntelog)) +
+  geom_stratum() + geom_text(stat = "stratum", infer.label = TRUE) + coord_flip()+
+  theme_classic() + scale_fill_manual(values=c("green","steelblue")) + facet_grid(.~imprint,scales="free")
+```
+
+```{r}
+m.stats <- subset(b.both.alluv2b,b.both.alluv2b$imprint %in% c("MEG","no.imprint"))
+p.stats <- subset(b.both.alluv2b,b.both.alluv2b$imprint %in% c("PEG","no.imprint"))
+
+a <- data.frame(m.stats %>% group_by(imprint,syntelog) %>% dplyr::summarise(n=sum(n)) %>% pivot_wider(names_from = syntelog, values_from = n))
+chisq.test(a[,2:3])
+
+d <- data.frame(p.stats %>% group_by(imprint,syntelog) %>% dplyr::summarise(n=sum(n)) %>% pivot_wider(names_from = syntelog, values_from = n))
+chisq.test(d[,2:3])
+```
+
+
+```{r}
+head(subset(b.both.contrasts.genes,b.both.contrasts.genes$imprint == "MEG" & b.both.contrasts.genes$syntenic.grasses == "nonsyntenic.grasses" & b.both.contrasts.genes$has.go.term == "no.GO"))
+```
+
+
+
+
+
+
+
+
+matTE things.
+```{r}
+b.both.te <- subset(b.both.contrasts,b.both.contrasts$feature_type == "TE")
+
+shared.BWP <- subset(te.anno.compare, te.anno.compare$B73 == "present" & nchar(te.anno.compare$B73.annotation == 21) & te.anno.compare$W22 == "present" & nchar(te.anno.compare$W22.annotation == 21)& te.anno.compare$PH207 == "present" & nchar(te.anno.compare$PH207.annotation == 21))
+
+b.both.te$shared.TE.BW <- ifelse(b.both.te$feature %in% shared.BW$B73.annotation, "shared.in.BW","variable.BW")
+b.both.te$shared.TE.BP <- ifelse(b.both.te$feature %in% shared.bp$B73.annotation, "shared.in.BP","variable.BP")
+b.both.te$shared.TE <- ifelse(b.both.te$feature %in% shared.BWP$B73.annotation, "shared.in.all","variable")
+
+mat.tes <- subset(b.both.te,b.both.te$imprint == "matTE")
+```
+
+```{r}
+mat.tes$order <- substr(mat.tes$feature,0,2)
+table(mat.tes[,c("order","shared.TE")])
+```
+
+```{r}
+mat.tes$fam <- substr(mat.tes$feature,0,8)
+tmp <- data.frame(table(mat.tes$fam))
+nrow(tmp)
+subset(tmp,tmp$Freq > 1)
+```
+
+```{r}
+b.both.tes <- subset(b.both.contrasts,b.both.contrasts$feature_type == "TE")
+b.both.tes$order <- factor(substr(b.both.tes$feature,0,2),levels=c("DH","DT","RL","RI","RS"))
+b.both.tes$shared.TE <- ifelse(b.both.tes$feature %in% shared.BWP$B73.annotation, "shared.in.all","variable")
+
+mat.tes.alluv <- data.frame(subset(b.both.tes,b.both.tes$order %in% c("RL","DT","DH")) %>% group_by(imprint,order,shared.TE,expression.type) %>% dplyr::summarise(n = n()))
+
+ggplot(data=mat.tes.alluv,
+       aes(axis4 = imprint, axis3 = order,axis2=shared.TE,axis1=expression.type,y=n)) +
+  scale_x_discrete(limits = rev(c("imprint","order","shared.TE", "expression.type")), expand = c(.1, .05)) +
+  xlab("features") +
+  geom_alluvium(aes(fill = order)) +
+  geom_stratum() + geom_text(stat = "stratum", infer.label = TRUE) + coord_flip()+
+  theme_classic() + facet_grid(.~imprint,scales="free") + scale_fill_manual(values=c("steelblue","green","darkorchid3"))
+```
+
+```{r}
+mat.tes.alluv <- data.frame(b.both.tes %>% group_by(imprint,order,shared.TE,expression.type) %>% dplyr::summarise(n = n()))
+
+ggplot(data=subset(mat.tes.alluv,mat.tes.alluv$imprint == "matTE"),
+       aes(axis3 = order,axis2=shared.TE,axis1=expression.type,y=n)) +
+  scale_x_discrete(limits = rev(c("order","shared.TE", "expression.type")), expand = c(.1, .05)) +
+  xlab("features") +
+  geom_alluvium(aes(fill = order)) +
+  geom_stratum() + geom_text(stat = "stratum", infer.label = TRUE) +
+  theme_classic() + scale_fill_manual(values=c("steelblue","green","darkorchid3","hotpink")) + coord_flip()
+```
+
+
+
+```{r}
+B73.te.attributes <- read.table("B73_filteredTE_combined_attributes_12.20.18.txt",header=T,stringsAsFactors = F,sep="\t")
+B73.te.attributes$imprint <- ifelse(B73.te.attributes$TE %in% mat.tes$feature, "matTE",
+                          ifelse(B73.te.attributes$TE %in% b.both.contrasts$feature, "no.imprint","not.detected"))
+LTR.age <- subset(B73.te.attributes,!is.na(B73.te.attributes$LTRsimilarity))
+ggplot(LTR.age,aes(x=imprint,y=LTRsimilarity,fill=imprint))+ geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + geom_violin() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank())   + stat_summary(fun.data = give.n, geom = "text") 
+```
+
+```{r}
+ggplot(subset(B73.te.attributes,B73.te.attributes$order %in% c("RL","DT","DH")),aes(x=imprint,y=disjoined,fill=imprint))+ geom_abline(slope=0, intercept=.33) + geom_abline(slope=0, intercept=.66) + geom_boxplot() + theme_classic() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank())   + stat_summary(fun.data = give.n, geom = "text") + facet_wrap(.~order,scales = "free")
+```
+
+Tissue-specific expression
+```{r}
+table(b.both.te[,c("imprint","expression.type")])
+133/(133 + 12)
+1465/(1465 + 1247)
+```
+
+
+are maternal TEs enriched for their closest gene being a MEG?
+```{r}
+# write.table(meg.tes[,1,drop=F],file="matTEs.txt",quote=F,row.names = F,col.names = F)
+```
+
+# Find closest gene to matTEs
+module load bedtools2/2.27.1-s2mtpsu
+sort -k 1,1 -k4,4n matTEs.gff3 | bedtools closest -D b -t all -wa -wb  -a - -b /work/LAS/sna-lab/sna/B74v4/Zea_mays.AGPv4.33.gene.gff3 > matTE_closest_gene_v2.bed
+cut -f 9,18,19 matTE_closest_gene_v2.bed > matTE_closest_gene_v2.txt
+
+```{r}
+matTE_closest_gene <- read.table("matTE_closest_gene_v2.txt",header=F,stringsAsFactors = F,sep="\t")
+matTE_closest_gene$TE <- substr(matTE_closest_gene$V1,4,24)
+matTE_closest_gene$gene <- substr(matTE_closest_gene$V2,4,17)
+matTE_closest_gene$distance <- matTE_closest_gene$V3
+matTE_closest_gene$TE.type <- ifelse(matTE_closest_gene$TE %in% meg.tes$feature,"matTE","No.Imprint")
+matTE_closest_gene$gene.type <- ifelse(matTE_closest_gene$gene %in% meg.genes$feature,"MEG",
+                                       ifelse(matTE_closest_gene$gene %in% peg.genes$feature, "PEG","No.Imprint"))
+matTE_closest_gene$distance.cat <- ifelse(matTE_closest_gene$distance == 0, "overlap",
+                                          ifelse(abs(matTE_closest_gene$distance) < 5000, "near","far"))
+table(matTE_closest_gene[,c("gene.type","distance.cat")])
+table(matTE_closest_gene[,c("gene.type","TE.type")])
+```
+Binomial test - are matTEs enriched for having MEG as nearest gene?
+```{r}
+successes <- nrow(subset(matTE_closest_gene,matTE_closest_gene$gene.type == "MEG"))
+trials <- length(unique(matTE_closest_gene$TE))
+proportion.genes.MEG <- nrow(subset(b.both.contrasts.genes,b.both.contrasts.genes$imprint == "MEG"))/nrow(b.both.contrasts.genes)
+binom.test(successes,trials,proportion.genes.MEG,alternative = "greater")
+
+successes.peg <- 0
+proportion.genes.PEG <- nrow(subset(b.both.contrasts.genes,b.both.contrasts.genes$imprint == "PEG"))/nrow(b.both.contrasts.genes)
+binom.test(successes.peg,trials,proportion.genes.PEG,alternative = "less")
+
+plot.test <- data.frame(matrix(NA,nrow=4,ncol=3))
+names(plot.test) <- c("set","imprint","freq")
+plot.test$imprint <- c("MEG","MEG","PEG","PEG")
+plot.test$set <- c("MEG.success","proportion.MEG","PEG.success","proportion.PEG")
+plot.test$freq <- c(successes/trials,proportion.genes.MEG,0,proportion.genes.PEG)
+
+ggplot() + geom_bar(aes(x=set,y=freq,fill="red"),data=plot.test,stat="identity",position = "identity", show.legend = FALSE) + theme_minimal() + ylim(0,0.15)  +  theme(axis.text.x = element_text(angle=90, hjust=1),panel.grid.major.x = element_blank()) + facet_wrap(imprint~.,scales="free_x")
+```
+Make version with Ns and where upstream and downstream are shown
+```{r}
+matTE.MEG <- subset(matTE_closest_gene,matTE_closest_gene$gene.type == "MEG")[,c("TE","gene","distance","TE.type","gene.type")]
+
+plot.test2 <- plot.test[2:4,1:2]
+plot.test2$count <- c(proportion.genes.MEG * trials,0,proportion.genes.PEG * trials)
+plot.test2$group <- c("expected","PEG","expected")
+plot.test2[4,] <- c("MEG.success","MEG",nrow(subset(matTE.MEG,matTE.MEG$distance < 0)),"upstream")
+plot.test2[5,] <- c("MEG.success","MEG",nrow(subset(matTE.MEG,matTE.MEG$distance == 0)),"overlap")
+plot.test2[6,] <- c("MEG.success","MEG",nrow(subset(matTE.MEG,matTE.MEG$distance > 0)),"downstream")
+plot.test2$count <- as.numeric(plot.test2$count)
+plot.test2$group <- factor(plot.test2$group,levels=c("upstream","overlap","downstream","expected","PEG"))
+plot.test2$set <- factor(c("MEG.expected","PEG.nearest","PEG.expected","MEG.nearest","MEG.nearest","MEG.nearest"),levels=c("MEG.nearest","MEG.expected","PEG.nearest","PEG.expected"))
+
+ggplot() + geom_bar(aes(x=set,y=count,fill=group),color="black",data=plot.test2,stat="identity",position = "identity") + theme_minimal()  +  theme(axis.text.x = element_text(angle=90, hjust=1),panel.grid.major.x = element_blank()) + facet_wrap(imprint~.,scales="free_x") + scale_fill_manual(values=c("indianred1","honeydew","lightblue3","black","yellow")) + scale_y_continuous(breaks=c(0,2,4,6,8,10),limits = c(0,11)) 
+```
+
+
+
+Table of matTE nearest gene is MEG
+```{r}
+matTE.MEG$order <- substr(matTE.MEG$TE,0,3)
+for(i in 1:nrow(matTE.MEG)){
+  if(matTE.MEG[i,"gene"] %in% plot.out2.bw$feature){
+    matTE.MEG[i,"ratio.BW.gene"] <- subset(plot.out2.bw,plot.out2.bw$feature == matTE.MEG[i,"gene"])[,"maternal_preference"]
+  }
+  else(matTE.MEG[i,"ratio.BW.gene"] <- "NA")
+  if(matTE.MEG[i,"gene"] %in% plot.out2.bp$feature){
+    matTE.MEG[i,"ratio.BP.gene"] <- subset(plot.out2.bp,plot.out2.bp$feature == matTE.MEG[i,"gene"])[,"maternal_preference"]
+  }
+  else(matTE.MEG[i,"ratio.BP.gene"] <- "NA")
+  if(matTE.MEG[i,"TE"] %in% plot.out2.bw$feature){
+    matTE.MEG[i,"ratio.BW.TE"] <- subset(plot.out2.bw,plot.out2.bw$feature == matTE.MEG[i,"TE"])[,"maternal_preference"]
+  }
+  else(matTE.MEG[i,"ratio.BW.TE"] <- "NA")
+  if(matTE.MEG[i,"TE"] %in% plot.out2.bp$feature){
+    matTE.MEG[i,"ratio.BP.TE"] <- subset(plot.out2.bp,plot.out2.bp$feature == matTE.MEG[i,"TE"])[,"maternal_preference"]
+  }
+  else(matTE.MEG[i,"ratio.BP.TE"] <- "NA")
+  matTE.MEG[i,"gene.variability"] <- subset(b.both.contrasts,b.both.contrasts$feature == matTE.MEG[i,"gene"])[,"syntelog"]
+  matTE.MEG[i,"gene.expression"] <- subset(b.both.contrasts,b.both.contrasts$feature == matTE.MEG[i,"gene"])[,"expression.type"]
+  matTE.MEG[i,"TE.expression"] <- subset(b.both.contrasts,b.both.contrasts$feature == matTE.MEG[i,"TE"])[,"expression.type"]
+}
+#write.table(matTE.MEG[order(matTE.MEG$distance),],file="matTE_closest_gene_is_MEG_v2.txt",quote=F,sep="\t",row.names = F)
+```
+
+```{r}
+matTE.MEG2 <- merge(matTE.MEG,te.anno.compare,by="TE",all.x=T)
+```
+
+Output files
+```{r}
+# write.table(b.both.contrasts,file="B73_features_both_contrasts.out.txt",sep="\t",quote=F,row.names = F)
+# names(plot.out2.bw)[14] <- "RER"
+# plot.out2.bw$imprint <- NULL
+# write.table(plot.out2.bw,file="B73.v.W22_features.out.txt",sep="\t",quote=F,row.names = F)
+# names(plot.out2.bp)[14] <- "RER"
+# plot.out2.bp$imprint <- NULL
+# write.table(plot.out2.bp,file="B73.v.PH207_features.out.txt",sep="\t",quote=F,row.names = F)
+# names(plot.out2.wp)[14] <- "RER"
+# plot.out2.wp$imprint <- NULL
+# write.table(plot.out2.wp,file="W22.v.PH207_features.out.txt",sep="\t",quote=F,row.names = F)
+```
+
+
+
+
+
+
+
+
+
+
+
+

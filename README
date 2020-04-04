@@ -1,0 +1,23 @@
+# Concatenate genomes
+qsub /home/springer/sna/scripts/shell/concat_3pairs.sh
+
+# Map reads to concatenated genomes
+qsub -t 2,3,4,14,15,16 -v LIST=imprint_samples.txt   /home/springer/sna/scripts/shell/imprint_concat_BW.sh
+qsub -t 11,12,13,17,18,19 -v LIST=imprint_samples.txt   /home/springer/sna/scripts/shell/imprint_concat_WP.sh
+qsub -t 5-10 -v LIST=imprint_samples.txt   /home/springer/sna/scripts/shell/imprint_concat_BP.sh
+
+# Combined mapped reads
+perl /home/springer/sna/scripts/combine_count_tables_input_command_line.pl counts_BW_endo1_to_BW_concat.txt counts_BW_endo2_to_BW_concat.txt  counts_BW_endo3_to_BW_concat.txt  counts_WB_endo1_to_BW_concat.txt counts_WB_endo2_to_BW_concat.txt  counts_WB_endo3_to_BW_concat.txt counts_BP_endo1_to_BP_concat.txt counts_BP_endo2_to_BP_concat.txt  counts_BP_endo3_to_BP_concat.txt  counts_PB_endo1_to_BP_concat.txt counts_PB_endo2_to_BP_concat.txt  counts_PB_endo3_to_BP_concat.txt counts_WP_endo1_to_WP_concat.txt counts_WP_endo2_to_WP_concat.txt  counts_WP_endo3_to_WP_concat.txt  counts_PW_endo1_to_WP_concat.txt counts_PW_endo2_to_WP_concat.txt  counts_PW_endo3_to_WP_concat.txt 
+
+# Add header
+echo -e "ID\tBW1\tBW2\tBW3\tWB1\tWB2\tWB3\tBP1\tBP2\tBP3\tPB1\tPB2\tPB3\tWP1\tWP2\tWP3\tPW1\tPW2\tPW3" | cat - combined_counts.txt > ~/te_expression/imprinting/combined_counts_all_concatinated_genomes_21Oct19.txt
+
+
+# Downstream analysis performed in R. See R notebook for analysis
+imprinting_github.Rmd
+
+# Output tables
+B73_features_both_contrasts.out.txt - Imprinting calls and attributes for B73 genes and TEs that were assessed for imprinting in either B73 x W22 or B73 x PH207 cross
+B73.v.W22_features.out.txt - Output from DESeq from B72 x W22 cross combined with RER values and filtered imprinting calls
+B73.v.PH207_features.out.txt - Output from DESeq from B72 x PH207 cross combined with RER values and filtered imprinting calls
+W22.v.PH207_features.out.txt - Output from DESeq from W22 x PH207 cross combined with RER values and filtered imprinting calls

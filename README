@@ -21,3 +21,5 @@ B73_features_both_contrasts.out.txt - Imprinting calls and attributes for B73 ge
 B73.v.W22_features.out.txt - Output from DESeq from B72 x W22 cross combined with RER values and filtered imprinting calls
 B73.v.PH207_features.out.txt - Output from DESeq from B72 x PH207 cross combined with RER values and filtered imprinting calls
 W22.v.PH207_features.out.txt - Output from DESeq from W22 x PH207 cross combined with RER values and filtered imprinting calls
+
+# For files needed to create Figure 1C, see https://github.com/kmhiggins/Imprinting_2020
